@@ -1,0 +1,45 @@
+---
+title: "Análisis resp vs no resp en teplizumab"
+output: 
+  pdf_document:
+    keep_tex: false
+date: "2026-05-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 60)
+)
+```
+
+Queremos ver dentro del grupo teplizumab los DEGs de los pacientes que progresaron o no hacia Diabetes.
+
+```{r}
+# Solo muestras Baseline de Teplizumab
+meta_tep_base <- metadata[metadata$Treatment == "Teplizumab" & 
+                           metadata$Month == "Baseline", ]
+counts_tep_base <- counts[, meta_tep_base$Library]
+
+# Respondedor como variable
+meta_tep_base$T1D <- factor(meta_tep_base$T1D, levels = c("0", "1"))
+
+dds_tep_base <- DESeqDataSetFromMatrix(
+  countData = counts_tep_base,
+  colData   = meta_tep_base,
+  design    = ~ T1D
+)
+
+keep <- rowSums(counts(dds_tep_base)) >= 10
+dds_tep_base <- dds_tep_base[keep, ]
+dds_tep_base <- DESeq(dds_tep_base, quiet = TRUE)
+
+res_tep_base <- results(dds_tep_base, 
+                         contrast = c("T1D", "1", "0"))
+summary(res_tep_base)
+```
+
+

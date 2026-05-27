@@ -1,0 +1,181 @@
+---
+title: "análisis longitudinal intra-pacientes"
+output: 
+  pdf_document:
+    keep_tex: false
+date: "2026-05-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 60)
+)
+```
+
+
+```{r}
+#paquetes
+library(dplyr)
+library(limma)
+library(edgeR)
+```
+
+
+# Análisis longitudinal intra-paciente
+
+```{r}
+# Tabla MASKID × timepoints disponibles
+
+tabla_timepoints <- metadata %>%
+  group_by(MASKID, Treatment, EBVserology) %>%
+  summarise(
+    Timepoints = paste(sort(unique(Month),
+                       levels = c("Baseline","Month1","Month3","Month14",
+                                  "Month18","Month30","Month40","Month84","Month100")),
+                  collapse = ", "),
+    N_muestras = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(Treatment, MASKID)
+
+print(tabla_timepoints)
+```
+
+No todos los pacientes tienen las mismas medidas. Se agrupan las muestras en baseline, early (month1, month4 y month14) y late (Month18, Month30, Month40, Month84, Month100)
+
+```{r}
+#preparar los grupos
+meta_long <- metadata %>%
+  mutate(
+    TimeGroup = case_when(
+      Month == "Baseline"                                              ~ "Baseline",
+      Month %in% c("Month1", "Month3", "Month14")                     ~ "Early",
+      Month %in% c("Month18","Month30","Month40","Month84","Month100") ~ "Late"
+    ),
+    TimeGroup = factor(TimeGroup, levels = c("Baseline","Early","Late")),
+    Treatment = factor(Treatment, levels = c("Placebo","Teplizumab")),
+    Group = factor(paste(Treatment, TimeGroup, sep = "."),
+                   levels = c("Placebo.Baseline","Placebo.Early","Placebo.Late",
+                               "Teplizumab.Baseline","Teplizumab.Early","Teplizumab.Late"))
+  )
+
+
+# Verificar representación
+cat("Muestras por grupo:\n")
+print(table(meta_long$Treatment, meta_long$TimeGroup))
+
+cat("\nPacientes únicos por grupo:\n")
+meta_long %>%
+  group_by(Treatment, TimeGroup) %>%
+  summarise(n_pacientes = n_distinct(MASKID), .groups = "drop") %>%
+  print()
+
+counts_long <- counts[, meta_long$Library]
+```
+
+```{r}
+#DGEList, filtrado y normalización 
+dge  <- DGEList(counts = counts_long)
+keep <- filterByExpr(dge, group = meta_long$Group)
+dge  <- dge[keep, ]
+dge  <- calcNormFactors(dge)
+
+cat("\nGenes tras filtrado:", nrow(dge), "\n")
+
+```
+
+```{r}
+#Matriz de diseño 
+design <- model.matrix(~ 0 + Group, data = meta_long)
+colnames(design) <- levels(meta_long$Group)
+```
+
+```{r}
+# Primera pasada voom + correlación intra-paciente
+v1     <- voom(dge, design, plot = FALSE)
+corfit <- duplicateCorrelation(v1, design, block = meta_long$MASKID)
+
+cat("\nCorrelación intra-paciente:", round(corfit$consensus, 3), "\n")
+
+#Segunda pasada voom con correlación 
+v2 <- voom(dge, design,
+           block       = meta_long$MASKID,
+           correlation = corfit$consensus,
+           plot        = TRUE)
+```
+```{r}
+#Ajuste del modelo 
+fit <- lmFit(v2, design,
+             block       = meta_long$MASKID,
+             correlation = corfit$consensus)
+```
+
+
+```{r}
+# Contrastes
+cm <- makeContrasts(
+  
+  # ── Efecto del tratamiento en cada timegroup ───────────────────────────
+  Tep_vs_Pla_Baseline = Teplizumab.Baseline - Placebo.Baseline,
+  Tep_vs_Pla_Early    = Teplizumab.Early    - Placebo.Early,
+  Tep_vs_Pla_Late     = Teplizumab.Late     - Placebo.Late,
+  
+  # ── Evolución temporal dentro de teplizumab ────────────────────────────
+  Tep_Early_vs_Baseline = Teplizumab.Early - Teplizumab.Baseline,
+  Tep_Late_vs_Baseline  = Teplizumab.Late  - Teplizumab.Baseline,
+  Tep_Late_vs_Early     = Teplizumab.Late  - Teplizumab.Early,
+  
+  # ── Evolución temporal dentro de placebo (control) ─────────────────────
+  Pla_Early_vs_Baseline = Placebo.Early - Placebo.Baseline,
+  Pla_Late_vs_Baseline  = Placebo.Late  - Placebo.Baseline,
+  Pla_Late_vs_Early     = Placebo.Late  - Placebo.Early,
+  
+  # ── Interacción: efecto específico del fármaco en el tiempo ───────────
+  Interaction_Early = (Teplizumab.Early - Teplizumab.Baseline) -
+                      (Placebo.Early    - Placebo.Baseline),
+  Interaction_Late  = (Teplizumab.Late  - Teplizumab.Baseline) -
+                      (Placebo.Late     - Placebo.Baseline),
+  
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, cm)
+fit2 <- eBayes(fit2)
+
+# ── 8. Extracción de resultados ────────────────────────────────────────────
+extraer <- function(coef) topTable(fit2, coef = coef, n = Inf, sort.by = "P")
+
+res <- list(
+  Tep_vs_Pla_Baseline   = extraer("Tep_vs_Pla_Baseline"),
+  Tep_vs_Pla_Early      = extraer("Tep_vs_Pla_Early"),
+  Tep_vs_Pla_Late       = extraer("Tep_vs_Pla_Late"),
+  Tep_Early_vs_Baseline = extraer("Tep_Early_vs_Baseline"),
+  Tep_Late_vs_Baseline  = extraer("Tep_Late_vs_Baseline"),
+  Tep_Late_vs_Early     = extraer("Tep_Late_vs_Early"),
+  Pla_Early_vs_Baseline = extraer("Pla_Early_vs_Baseline"),
+  Pla_Late_vs_Baseline  = extraer("Pla_Late_vs_Baseline"),
+  Pla_Late_vs_Early     = extraer("Pla_Late_vs_Early"),
+  Interaction_Early     = extraer("Interaction_Early"),
+  Interaction_Late      = extraer("Interaction_Late")
+)
+
+# ── 9. Resumen de DEGs ─────────────────────────────────────────────────────
+cat("\n── DEGs (FDR < 0.05) ──────────────────────────────────────────\n")
+for (nombre in names(res)) {
+  n <- sum(res[[nombre]]$adj.P.Val < 0.05)
+  cat(sprintf("%-30s %d\n", nombre, n))
+}
+```
+Practicamente sin DEGs, lo cual es consistente con todo lo que hemos visto: el dataset tiene muy pocas muestras para detectar diferencias significativas a nivel de gen individual. Solo 1 DEG en Tep_Late_vs_Baseline.
+Esto no significa que no haya señal biologica, sino que el analisis gen a gen no tiene potencia suficiente. 
+
+
+```{r}
+subset(res$Tep_Late_vs_Baseline, adj.P.Val < 0.05)
+```
+
+

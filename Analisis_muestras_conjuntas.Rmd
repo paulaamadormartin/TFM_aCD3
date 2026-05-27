@@ -1,0 +1,596 @@
+---
+title: "Análisis expresión muestras conjuntas"
+author: "Paula Amador Martín"
+output: 
+  pdf_document:
+    keep_tex: false
+date: "2026-04-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 60)
+)
+```
+
+```{r}
+#paquetes
+library(here)
+library(formatR)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(apeglm)
+library(enrichplot)
+library(ashr)
+```
+
+# Análisis general de las muestras
+## 1. Cargar y explorar los datos
+Partimos de la matriz de conteos de los datos del artículo [Teplizumab induces persistent changes in the antigen-specific repertoire in individuals at risk for type 1 diabetes](https://www.jci.org/articles/view/177492#sd) y del archivo de metadatos donde se índica la información de cada muestra. 
+
+```{r}
+# Matriz de counts
+counts <- read.table(here("data", "countsall.txt"), header = TRUE, row.names = 1, sep = "\t")
+# Metadatos 
+metadata <- read.table(here("data","metadata_TN10trial_bulk.txt"), header = TRUE, sep = "\t")
+```
+
+Exploramos los datos que tenemos
+
+```{r}
+#Dimensiones de la matriz de counts
+cat("- Número de genes:", nrow(counts), "\n")
+cat("- Número de muestras:", ncol(counts), "\n\n")
+
+head(counts)
+head(metadata) 
+
+#simplificamos los nombres de las muestras
+colnames(counts) <- gsub("_R1_001.fastq.gz.bam", "", colnames(counts))
+metadata$Library <- gsub("_R1_001.fastq.gz.bam", "", metadata$Library)
+# Verifica que coinciden
+all(colnames(counts) == metadata$Library)
+```
+
+```{r}
+# Reordenamos metadata según el orden de columnas de counts
+metadata <- metadata[match(colnames(counts), metadata$Library), ]
+all(colnames(counts) == metadata$Library)
+```
+
+Encontramos un error en las muestras cuyo MASKID es "341455", "839473" y "902103" ya que no tienen baseline debido a un error en la secuenaciación de estos viales. Además, las muestras "230915" y "582246" tienen la etiqueta month1 de forma erronea, debería ser baseline. Decidimos eliminar aquellas que no tienen baseline y cambiar el error de month1 a baseline. 
+
+```{r}
+metadata <- metadata[!metadata$MASKID %in% c("341455", "839473", "902103"), ]
+metadata$Month[metadata$MASKID %in% c("230915", "582246") & metadata$Month == "Month1"] <- "Baseline"
+# Eliminar columnas de los counts
+counts <- counts[, !colnames(counts) %in% c("T1D_12_S60", "T1D_26_S74", "T1D_39_S87", "T1D_8_S56", "T1D_11_S59", "T1D_18_S66", "T1D_19_S67")]
+```
+
+
+
+```{r}
+# Convertimos las variables a factor
+metadata$Month <- factor(metadata$Month, levels = c("Baseline", "Month1", "Month3", "Month14", "Month18", "Month30", "Month40", "Month84", "Month100"))
+metadata$EBVserology <- factor(metadata$EBVserology)
+metadata$MASKID <- factor(metadata$MASKID)
+#Treatment a factor con Placebo como referencia
+metadata$Treatment <- factor(metadata$Treatment, levels = c("Placebo", "Teplizumab"))
+```
+
+```{r}
+cat("- Tratamientos:", paste(unique(metadata$Treatment), collapse = ", "), "\n")
+cat("- Timepoints:", paste(unique(metadata$Month), collapse = ", "), "\n")
+cat("- EBV serología:", paste(unique(metadata$EBVserology), collapse = ", "), "\n")
+```
+
+## 2. Expresión diferencial de genes
+Una vez explorados los datos, pasamos a la expresión diferencial de los genes. 
+Con el objetivo de identificar genes diferencialmente expresados (DEGs) entre los pacientes tratados con teplizumab y los tratados con placebo, se emplea el paquete DESeq2, que implementa un modelo estadístico basado en la distribución binomial negativa, adecuado para datos de RNA-seq con counts crudos.
+
+Primero se crea el objeto DESeqDataSet a partir de la matriz de counts y los metadatos clínicos, especificando el tratamiento como variable de diseño (~ Treatment), con el grupo placebo como referencia. Previamente al análisis, se aplicó un filtrado de genes con expresión muy baja, eliminando aquellos con un número total de counts inferior a 10 en el conjunto de muestras, con el fin de reducir el ruido y mejorar la potencia estadística del análisis.
+
+```{r}
+#contrucción objeto DESeq2
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = metadata,
+  design    = ~ Treatment
+)
+dds
+```
+
+```{r}
+# Filtramos genes con menos de 10 counts en total
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+nrow(dds)
+```
+
+```{r}
+#análisis con DESeq
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("Treatment", "Teplizumab", "Placebo"))
+summary(res)
+```
+
+```{r}
+# Convertir a dataframe y ordenar por p-valor ajustado
+res_df <- as.data.frame(res)
+res_df <- res_df[order(res_df$padj), ]
+head(res_df, 20)
+```
+
+## 3. Visualización de los datos
+
+Para la visualización de los datos aplicamos shrinkage a los valores de log fold change (LFC), porque los genes con pocos counts tienen estimaciones de LFC muy infladas e imprecisas.
+Ejemplo:
+Dos genes con LFC = 3:
+
+- Gen A: 2 counts en placebo, 16 en teplizumab → LFC = 3, pero con tan pocos counts es poco fiable
+- Gen B: 200 counts en placebo, 1600 en teplizumab → LFC = 3, estimación muy robusta
+
+Sin shrinkage ambos genes aparecen igual en el volcano plot, cuando en realidad Gen A tiene mucha más incertidumbre.
+
+```{r}
+res_shrunk <- lfcShrink(dds, coef = "Treatment_Teplizumab_vs_Placebo", type = "apeglm")
+summary(res_shrunk)
+```
+
+```{r}
+res_df_shrunk <- as.data.frame(res_shrunk)
+res_df_shrunk$gene <- rownames(res_df_shrunk)
+res_df_shrunk$significant <- ifelse(
+  res_df_shrunk$padj < 0.05 & abs(res_df_shrunk$log2FoldChange) > 1,
+  "DEG", "No significativo"
+)
+
+# Volcano plot
+p<-ggplot(res_df_shrunk, aes(x = log2FoldChange, y = -log10(padj), color = significant)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_text_repel(
+    data = subset(res_df_shrunk, padj < 0.05 & abs(log2FoldChange) > 1),
+    aes(label = gene), size = 3, max.overlaps = 20
+  ) +
+  scale_color_manual(values = c("DEG" = "red", "No significativo" = "grey")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "Teplizumab vs Placebo", x = "Log2 Fold Change", y = "-log10(padj)") +
+  theme_classic() +
+  guides(color = guide_legend(override.aes = list(size = 3, shape = 16)))
+
+ggsave(here("results", "volcano_teplizumab_vs_placebo.png"), 
+       plot = p, width = 8, height = 6, dpi = 300)
+p
+```
+
+
+```{r resumen_DEGs}
+# Total de DEGs con padj < 0.05
+degs_05 <- subset(res_df, padj < 0.05 & !is.na(padj))
+
+cat("Con FDR < 0.05:\n")
+cat("- Total DEGs:", nrow(degs_05), "\n")
+cat("- Sobreexpresados:", sum(degs_05$log2FoldChange > 0), "\n")
+cat("- Infraexpresados:", sum(degs_05$log2FoldChange < 0), "\n")
+```
+
+El análisis de expresión diferencial entre pacientes tratados con teplizumab y placebo identificó un total de 226 DEGs con un FDR < 0.05, de los cuales 77 se encontraron sobreexpresados y 149 infraexpresados en el grupo teplizumab respecto al placebo.
+Los DEGs (rojos) se distribuyen asimétricamente, hay más genes sobreexpresados (derecha) que infraexpresados (izquierda) en teplizumab.
+
+
+## 4. Análisis de enriquecimiento de vías. 
+Con el objetivo de identificar los procesos biológicos y rutas moleculares coordinadamente alteradas por el tratamiento con teplizumab, se llevó a cabo un análisis de enriquecimiento de vías mediante GSEA (Gene Set Enrichment Analysis). GSEA utiliza la totalidad de los genes detectados, ordenados según su estadístico de Wald, lo que permite detectar señal biológica coordinada incluso cuando los cambios individuales de expresión no alcanzan significación estadística. 
+
+El ranking de genes se construyó a partir del estadístico de Wald obtenido en el análisis de expresión diferencial, de forma que los genes más sobreexpresados en teplizumab se sitúan en la parte superior del ranking y los más infraexpresados en la parte inferior. El análisis se realizó contra dos bases de datos de referencia de forma complementaria: la ontología génica de procesos biológicos (GO-BP) mediante la función gseGO(), y las rutas metabólicas e inmunológicas de KEGG mediante gseKEGG(), ambas implementadas en el paquete clusterProfiler. Se consideraron significativas las rutas con un FDR < 0.05.
+
+```{r}
+# Creamos el ranking con todos los genes (estadístico de Wald)
+gene_list <- res_df$stat
+names(gene_list) <- rownames(res_df)
+
+# Eliminamos NAs y ordenamos de mayor a menor
+gene_list <- gene_list[!is.na(gene_list)]
+gene_list <- sort(gene_list, decreasing = TRUE)
+length(gene_list)
+
+#GSEA
+gsea_go <- gseGO(
+  geneList     = gene_list,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "SYMBOL",
+  ont          = "BP",        # Biological Process
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = TRUE
+)
+
+summary(as.data.frame(gsea_go))
+```
+
+```{r}
+as.data.frame(gsea_go)[, c("Description", "NES", "pvalue", "p.adjust")]
+```
+El análisis GSEA usando la ontología génica de procesos biológicos (GO-BP) identificó 204 rutas significativamente enriquecidas (FDR < 0.05), todas ellas con NES negativo. El NES (Normalized Enrichment Score) es la métrica principal de GSEA que mide si los genes de una ruta están coordinadamente en un extremo del ranking (sobreexpresados o infraexpresados).Si son negativos indica que estas vías están suprimidas en el grupo teplizumab respecto al placebo.
+
+
+
+Ahora probamos con la base de datos KEGG para comparar. Para ellos primero hay que convertir los gene symbols a ENTREZID.
+
+```{r}
+gene_list_entrez <- bitr(names(gene_list),
+                         fromType = "SYMBOL",
+                         toType   = "ENTREZID",
+                         OrgDb    = org.Hs.eg.db)
+
+# Crea el ranking con ENTREZID
+gene_list_kegg <- gene_list[gene_list_entrez$SYMBOL]
+names(gene_list_kegg) <- gene_list_entrez$ENTREZID
+
+# Elimina duplicados y ordena
+gene_list_kegg <- gene_list_kegg[!duplicated(names(gene_list_kegg))]
+gene_list_kegg <- sort(gene_list_kegg, decreasing = TRUE)
+
+cat("Genes en el ranking KEGG:", length(gene_list_kegg), "\n")
+```
+
+```{r}
+gsea_kegg <- gseKEGG(
+  geneList     = gene_list_kegg,
+  organism     = "hsa",
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = TRUE
+)
+
+as.data.frame(gsea_kegg)[, c("Description", "NES", "pvalue", "p.adjust")]
+```
+
+El análisis GSEA contra la base de datos KEGG identificó 35 rutas significativamente enriquecidas (FDR < 0.05), todas con NES negativo, confirmando la supresión coordinada de procesos biológicos en el grupo teplizumab respecto al placebo. Estos resultados son consistentes y complementarios con los obtenidos en el análisis GSEA-GO.
+
+Estas rutas las podemos agrupar en 3 grupos funcionales:
+1. Metabolismo mitocondrial y fosforilación oxidativa
+2. Inmunología y fagocitosis
+3. Rutas de neurodegeneración
+
+### Visualización GSEA
+```{r}
+#Dotplot - resumen de rutas enriquecidas
+dotplot(gsea_go, showCategory = 13, title = "GSEA-GO: Procesos biológicos") +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+## 5. Análisis EBV
+
+El siguiente paso es hacer un análisis de los pacientes tratados con teplizumab que son EBV positivos y EBV negativos, así como los tratados con placebo. 
+
+Primero vemos como están distribuidos los datos
+
+```{r}
+table(metadata$EBVserology, metadata$Treatment)
+```
+Primero vamos a comparar aquellos pacintes EBV+ vs EBV- dentro del grupo teplizumab
+
+```{r}
+# Filtramos solo las muestras teplizumab
+metadata_tep <- metadata[metadata$Treatment == "Teplizumab", ]
+counts_tep <- counts[, metadata_tep$Library]
+
+# Verifica
+dim(counts_tep)
+table(metadata_tep$EBVserology)
+```
+```{r}
+# Creamos el objeto DESeq2 solo con muestras teplizumab
+metadata_tep$EBVserology <- factor(metadata_tep$EBVserology, 
+                                    levels = c("Negative", "Positive"))
+
+dds_tep <- DESeqDataSetFromMatrix(
+  countData = counts_tep,
+  colData   = metadata_tep,
+  design    = ~ EBVserology
+)
+
+# Filtrado
+keep <- rowSums(counts(dds_tep)) >= 10
+dds_tep <- dds_tep[keep, ]
+cat("Genes tras filtrado:", nrow(dds_tep), "\n")
+```
+```{r}
+#DESeq
+dds_tep <- DESeq(dds_tep)
+res_tep <- results(dds_tep, contrast = c("EBVserology", "Positive", "Negative"))
+summary(res_tep)
+```
+Ahora tenemos:
+
+- 54 genes sobreexpresados en EBV positivo
+
+- 77 genes infraexpresados en EBV positivo
+
+- 131 DEGs en total 
+
+Esto puede indicar que ser EBV+ o EBV- tiene un gran impacto transcriptómico en el grupo teplizumab
+
+Volvemos a aplicar el shrinkage
+```{r}
+res_tep_shrunk <- lfcShrink(dds_tep, 
+                             coef = "EBVserology_Positive_vs_Negative", 
+                             type = "apeglm")
+
+res_tep_df <- as.data.frame(res_tep)
+res_tep_df <- res_tep_df[order(res_tep_df$padj), ]
+
+head(res_tep_df, 20)
+```
+Tenemos que:
+
+- LFC positivo: sobreexpresado en el primer grupo del contraste (EBV+)
+
+- LFC negativo: infraexpresado en el primer grupo, es decir, más expresado en EBV-
+
+### Visualización
+
+```{r}
+res_tep_shrunk_df <- as.data.frame(res_tep_shrunk)
+res_tep_shrunk_df$gene <- rownames(res_tep_shrunk_df)
+res_tep_shrunk_df$significant <- ifelse(
+  res_tep_shrunk_df$padj < 0.05 & abs(res_tep_shrunk_df$log2FoldChange) > 1,
+  "DEG", "No significativo"
+)
+
+p_tep <- ggplot(res_tep_shrunk_df, aes(x = log2FoldChange, y = -log10(padj), color = significant)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_text_repel(
+    data = subset(res_tep_shrunk_df, padj < 0.05 & abs(log2FoldChange) > 1),
+    aes(label = gene), size = 3, max.overlaps = 20
+  ) +
+  scale_color_manual(values = c("DEG" = "red", "No significativo" = "grey")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "EBV+ vs EBV- en pacientes tratados con Teplizumab", 
+       x = "Log2 Fold Change", y = "-log10(padj)") +
+  theme_classic() +
+  guides(color = guide_legend(override.aes = list(size = 3, shape = 16)))
+
+ggsave(here("results", "volcano_EBV_teplizumab.png"),
+       plot = p_tep, width = 8, height = 6, dpi = 300)
+
+p_tep
+```
+
+Vemos cuantos DEGs hay según el nivel de significancia:
+
+```{r}
+degs_tep_05 <- subset(res_tep_df, padj < 0.05 & !is.na(padj))
+
+cat("Con FDR < 0.05:\n")
+cat("- Total DEGs:", nrow(degs_tep_05), "\n")
+cat("- Sobreexpresados en EBV+:", sum(degs_tep_05$log2FoldChange > 0), "\n")
+cat("- Infraexpresados en EBV+:", sum(degs_tep_05$log2FoldChange < 0), "\n")
+```
+
+## Análisis de enriquecimiento de vías
+
+```{r}
+#filtramos por el estadístico de Wald
+gene_list_tep <- res_tep_df$stat
+names(gene_list_tep) <- rownames(res_tep_df)
+gene_list_tep <- gene_list_tep[!is.na(gene_list_tep)]
+gene_list_tep <- sort(gene_list_tep, decreasing = TRUE)
+
+cat("Genes en el ranking:", length(gene_list_tep), "\n")
+```
+
+```{r}
+gsea_go_tep <- gseGO(
+  geneList     = gene_list_tep,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "SYMBOL",
+  ont          = "BP",
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = TRUE
+)
+
+# Top rutas más significativas
+gsea_go_tep_df <- as.data.frame(gsea_go_tep)
+gsea_go_tep_df <- gsea_go_tep_df[order(gsea_go_tep_df$p.adjust), ]
+
+# Ver top 20
+gsea_go_tep_df[1:20, c("Description", "NES", "pvalue", "p.adjust")]
+```
+
+
+Ahora probamos con KEGG para comparar las rutas que salen
+
+```{r}
+# Conviertimos a ENTREZID
+gene_list_tep_entrez <- bitr(names(gene_list_tep),
+                              fromType = "SYMBOL",
+                              toType   = "ENTREZID",
+                              OrgDb    = org.Hs.eg.db)
+
+# ranking con ENTREZID
+gene_list_tep_kegg <- gene_list_tep[gene_list_tep_entrez$SYMBOL]
+names(gene_list_tep_kegg) <- gene_list_tep_entrez$ENTREZID
+gene_list_tep_kegg <- gene_list_tep_kegg[!duplicated(names(gene_list_tep_kegg))]
+gene_list_tep_kegg <- sort(gene_list_tep_kegg, decreasing = TRUE)
+
+cat("Genes en el ranking KEGG:", length(gene_list_tep_kegg), "\n")
+```
+```{r}
+gsea_kegg_tep <- gseKEGG(
+  geneList     = gene_list_tep_kegg,
+  organism     = "hsa",
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = TRUE
+)
+
+gsea_kegg_tep_df <- as.data.frame(gsea_kegg_tep)
+gsea_kegg_tep_df <- gsea_kegg_tep_df[order(gsea_kegg_tep_df$p.adjust), ]
+
+gsea_kegg_tep_df[1:20, c("Description", "NES", "pvalue", "p.adjust")]
+```
+
+### Visualización 
+
+```{r}
+# Dotplot gseGO
+dotplot(gsea_go_tep, showCategory = 20, title = "GSEA-GO: EBV+ vs EBV- en Teplizumab") +
+  theme(axis.text.y = element_text(size = 8))
+
+# Dotplot gseKEGG
+dotplot(gsea_kegg_tep, showCategory = 20, title = "GSEA-KEGG: EBV+ vs EBV- en Teplizumab") +
+  theme(axis.text.y = element_text(size = 8))
+```
+
+Ahora comprobamos qué resultados obtenemos comparando pacientes EBV+ vs EBV- en el grupo placebo
+
+```{r}
+# muestras placebo
+metadata_plac <- metadata[metadata$Treatment == "Placebo", ]
+counts_plac <- counts[, metadata_plac$Library]
+
+dim(counts_plac)
+table(metadata_plac$EBVserology)
+```
+
+```{r}
+metadata_plac$EBVserology <- factor(metadata_plac$EBVserology, 
+                                     levels = c("Negative", "Positive"))
+
+dds_plac <- DESeqDataSetFromMatrix(
+  countData = counts_plac,
+  colData   = metadata_plac,
+  design    = ~ EBVserology
+)
+
+# Filtrado
+keep <- rowSums(counts(dds_plac)) >= 10
+dds_plac <- dds_plac[keep, ]
+cat("Genes tras filtrado:", nrow(dds_plac), "\n")
+```
+```{r}
+dds_plac <- DESeq(dds_plac)
+res_plac <- results(dds_plac, contrast = c("EBVserology", "Positive", "Negative"))
+summary(res_plac)
+```
+```{r}
+res_plac_shrunk <- lfcShrink(dds_plac, 
+                              coef = "EBVserology_Positive_vs_Negative", 
+                              type = "apeglm")
+
+res_plac_df <- as.data.frame(res_plac)
+res_plac_df <- res_plac_df[order(res_plac_df$padj), ]
+
+head(res_plac_df, 20)
+```
+```{r}
+res_plac_shrunk <- lfcShrink(dds_plac,
+                              coef = "EBVserology_Positive_vs_Negative",
+                              type = "apeglm")
+
+res_plac_shrunk_df <- as.data.frame(res_plac_shrunk)
+res_plac_shrunk_df$gene <- rownames(res_plac_shrunk_df)
+res_plac_shrunk_df$significant <- ifelse(
+  res_plac_shrunk_df$padj < 0.05 & abs(res_plac_shrunk_df$log2FoldChange) > 1,
+  "DEG", "No significativo"
+)
+
+p_plac <- ggplot(res_plac_shrunk_df, aes(x = log2FoldChange, y = -log10(padj), color = significant)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_text_repel(
+    data = subset(res_plac_shrunk_df, padj < 0.05 & abs(log2FoldChange) > 1),
+    aes(label = gene), size = 3, max.overlaps = 20
+  ) +
+  scale_color_manual(values = c("DEG" = "red", "No significativo" = "grey")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "EBV+ vs EBV- en pacientes tratados con Placebo",
+       x = "Log2 Fold Change", y = "-log10(padj)") +
+  theme_classic() +
+  guides(color = guide_legend(override.aes = list(size = 3, shape = 16)))
+
+ggsave(here("results", "volcano_EBV_placebo.png"),
+       plot = p_plac, width = 8, height = 6, dpi = 300)
+
+p_plac
+```
+GSEA
+
+```{r}
+gene_list_plac <- res_plac_df$stat
+names(gene_list_plac) <- rownames(res_plac_df)
+gene_list_plac <- gene_list_plac[!is.na(gene_list_plac)]
+gene_list_plac <- sort(gene_list_plac, decreasing = TRUE)
+
+cat("Genes en el ranking:", length(gene_list_plac), "\n")
+```
+```{r}
+gsea_go_plac <- gseGO(
+  geneList     = gene_list_plac,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "SYMBOL",
+  ont          = "BP",
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = TRUE
+)
+
+gsea_go_plac_df <- as.data.frame(gsea_go_plac)
+gsea_go_plac_df <- gsea_go_plac_df[order(gsea_go_plac_df$p.adjust), ]
+gsea_go_plac_df[1:20, c("Description", "NES", "pvalue", "p.adjust")]
+```
+
+```{r}
+#ENTREZID
+gene_list_plac_entrez <- bitr(names(gene_list_plac),
+                               fromType = "SYMBOL",
+                               toType   = "ENTREZID",
+                               OrgDb    = org.Hs.eg.db)
+
+
+gene_list_plac_kegg <- gene_list_plac[gene_list_plac_entrez$SYMBOL]
+names(gene_list_plac_kegg) <- gene_list_plac_entrez$ENTREZID
+gene_list_plac_kegg <- gene_list_plac_kegg[!duplicated(names(gene_list_plac_kegg))]
+gene_list_plac_kegg <- sort(gene_list_plac_kegg, decreasing = TRUE)
+
+cat("Genes en el ranking KEGG:", length(gene_list_plac_kegg), "\n")
+```
+```{r}
+gsea_kegg_plac <- gseKEGG(
+  geneList     = gene_list_plac_kegg,
+  organism     = "hsa",
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = TRUE
+)
+
+gsea_kegg_plac_df <- as.data.frame(gsea_kegg_plac)
+gsea_kegg_plac_df <- gsea_kegg_plac_df[order(gsea_kegg_plac_df$p.adjust), ]
+gsea_kegg_plac_df[1:20, c("Description", "NES", "pvalue", "p.adjust")]
+```
+
+
+
+
+
+
+
+
+

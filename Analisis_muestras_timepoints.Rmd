@@ -1,0 +1,543 @@
+---
+title: "Análisis de expresión muestras por timepoints"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: false
+    fig_caption: true
+date: "2026-05-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 60),
+  fig.path = "figures/",   
+  dev = "png"
+)
+```
+
+```{r}
+#paquetes
+library(here)
+library(formatR)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(apeglm)
+library(enrichplot)
+library(ashr)
+```
+
+```{r}
+# Matriz de counts
+counts <- read.table(here("data", "countsall.txt"), header = TRUE, row.names = 1, sep = "\t")
+# Metadatos 
+metadata <- read.table(here("data","metadata_TN10trial_bulk.txt"), header = TRUE, sep = "\t")
+```
+
+Exploramos los datos que tenemos
+
+```{r}
+#Dimensiones de la matriz de counts
+cat("- Número de genes:", nrow(counts), "\n")
+cat("- Número de muestras:", ncol(counts), "\n\n")
+
+head(counts)
+head(metadata) 
+
+#simplificamos los nombres de las muestras
+colnames(counts) <- gsub("_R1_001.fastq.gz.bam", "", colnames(counts))
+metadata$Library <- gsub("_R1_001.fastq.gz.bam", "", metadata$Library)
+# Verifica que coinciden
+all(colnames(counts) == metadata$Library)
+```
+
+```{r}
+# Reordenamos metadata según el orden de columnas de counts
+metadata <- metadata[match(colnames(counts), metadata$Library), ]
+all(colnames(counts) == metadata$Library)
+```
+
+Encontramos un error en las muestras cuyo MASKID es "341455", "839473" y "902103" ya que no tienen baseline debido a un error en la secuenaciación de estos viales. Además, las muestras "230915" y "582246" tienen la etiqueta month1 de forma erronea, debería ser baseline. Decidimos eliminar aquellas que no tienen baseline y cambiar el error de month1 a baseline. 
+
+```{r}
+metadata <- metadata[!metadata$MASKID %in% c("341455", "839473", "902103"), ]
+metadata$Month[metadata$MASKID %in% c("230915", "582246") & metadata$Month == "Month1"] <- "Baseline"
+# Eliminar columnas de los counts
+counts <- counts[, !colnames(counts) %in% c("T1D_12_S60", "T1D_26_S74", "T1D_39_S87", "T1D_8_S56", "T1D_11_S59", "T1D_18_S66", "T1D_19_S67")]
+
+all(colnames(counts) == metadata$Library)
+```
+
+
+
+```{r}
+# Convertimos las variables a factor
+metadata$Month <- factor(metadata$Month, levels = c("Baseline", "Month1", "Month3", "Month14", "Month18", "Month30", "Month40", "Month84", "Month100"))
+metadata$EBVserology <- factor(metadata$EBVserology)
+metadata$MASKID <- factor(metadata$MASKID)
+#Treatment a factor con Placebo como referencia
+metadata$Treatment <- factor(metadata$Treatment, levels = c("Placebo", "Teplizumab"))
+```
+
+```{r}
+cat("- Tratamientos:", paste(unique(metadata$Treatment), collapse = ", "), "\n")
+cat("- Timepoints:", paste(unique(metadata$Month), collapse = ", "), "\n")
+cat("- EBV serología:", paste(unique(metadata$EBVserology), collapse = ", "), "\n")
+```
+
+
+# Análisis según tiempo de administración del fármaco
+
+## Baseline EBV+ vs EBV-
+
+El objetivo es identificar diferencias transcriptómicas entre pacientes EBV+ y EBV- antes del cualquier tratamiento.
+
+```{r}
+# Seleccionamos solo las muestras de Baseline
+metadata_baseline <- metadata[metadata$Month == "Baseline", ]
+counts_baseline <- counts[, metadata_baseline$Library]
+
+cat("Muestras en Baseline:", nrow(metadata_baseline), "\n")
+
+table(metadata_baseline$EBVserology, metadata_baseline$Treatment)
+```
+
+```{r}
+#creamos el objeto DESeq
+# EBVserology con Negative como referencia
+metadata_baseline$EBVserology <- factor(metadata_baseline$EBVserology,
+                                         levels = c("Negative", "Positive"))
+metadata_baseline$Treatment <- factor(metadata_baseline$Treatment,
+                                       levels = c("Placebo", "Teplizumab"))
+
+dds_baseline <- DESeqDataSetFromMatrix(
+  countData = counts_baseline,
+  colData   = metadata_baseline,
+  design    = ~ Treatment + EBVserology  # controlamos por tratamiento
+)
+
+# Filtrado
+keep <- rowSums(counts(dds_baseline)) >= 10
+dds_baseline <- dds_baseline[keep, ]
+cat("Genes tras filtrado:", nrow(dds_baseline), "\n")
+```
+
+```{r}
+#Análisis diferencial
+dds_baseline <- DESeq(dds_baseline)
+res_baseline <- results(dds_baseline,
+                         contrast = c("EBVserology", "Positive", "Negative"))
+summary(res_baseline)
+```
+
+
+```{r}
+#shrink ashr
+res_baseline_shrunk <- lfcShrink(dds_baseline,
+                                  contrast = c("EBVserology", "Positive", "Negative"),
+                                  type = "ashr")
+
+res_baseline_shrunk_df <- as.data.frame(res_baseline_shrunk)
+res_baseline_shrunk_df <- res_baseline_shrunk_df[order(res_baseline_shrunk_df$padj), ]
+head(res_baseline_shrunk_df, 20)
+```
+
+
+
+```{r}
+#Resumen de DEGs
+#degs_baseline_10 <- subset(res_baseline_shrunk_df, padj < 0.1 & !is.na(padj))
+degs_baseline_05 <- subset(res_baseline_shrunk_df, padj < 0.05 & !is.na(padj))
+
+#cat("Con FDR < 0.1:\n")
+#cat("- Total DEGs:", nrow(degs_baseline_10), "\n")
+#cat("- Sobreexpresados en EBV+:", sum(degs_baseline_10$log2FoldChange > 0), "\n")
+#cat("- Infraexpresados en EBV+:", sum(degs_baseline_10$log2FoldChange < 0), "\n\n")
+
+cat("Con FDR < 0.05:\n")
+cat("- Total DEGs:", nrow(degs_baseline_05), "\n")
+cat("- Sobreexpresados en EBV+:", sum(degs_baseline_05$log2FoldChange > 0), "\n")
+cat("- Infraexpresados en EBV+:", sum(degs_baseline_05$log2FoldChange < 0), "\n")
+```
+
+
+
+```{r volcano_baseline, fig.width=8, fig.height=6}
+#volcano plot
+res_baseline_shrunk_df$gene <- rownames(res_baseline_shrunk_df)
+res_baseline_shrunk_df$significant <- ifelse(
+  res_baseline_shrunk_df$padj < 0.05 & !is.na(res_baseline_shrunk_df$padj),
+  "DEG", "No significativo"
+)
+
+p_baseline <- ggplot(res_baseline_shrunk_df,
+                      aes(x = log2FoldChange, y = -log10(padj), color = significant)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_text_repel(
+    data = subset(res_baseline_shrunk_df, padj < 0.05 & !is.na(padj)),
+    aes(label = gene), size = 3, max.overlaps = 20
+  ) +
+  scale_color_manual(values = c("DEG" = "red", "No significativo" = "grey")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "Baseline: EBV+ vs EBV-",
+       subtitle = "Controlando por tratamiento (n = 12 pacientes)",
+       x = "Log2 Fold Change (ashr)", y = "-log10(padj)") +
+  theme_classic() +
+  guides(color = guide_legend(override.aes = list(size = 3, shape = 16)))
+
+ggsave(here("results", "volcano_baseline_EBV.png"),
+       plot = p_baseline, width = 8, height = 6, dpi = 300)
+p_baseline
+```
+
+```{r}
+#GSEA
+gene_list_baseline <- as.data.frame(res_baseline)$stat
+names(gene_list_baseline) <- rownames(res_baseline)
+gene_list_baseline <- gene_list_baseline[!is.na(gene_list_baseline)]
+gene_list_baseline <- sort(gene_list_baseline, decreasing = TRUE)
+
+cat("Genes en el ranking:", length(gene_list_baseline), "\n")
+```
+
+```{r}
+gsea_go_baseline <- gseGO(
+  geneList     = gene_list_baseline,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "SYMBOL",
+  ont          = "BP",
+  minGSSize    = 15,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = TRUE,
+)
+
+gsea_go_baseline_df <- as.data.frame(gsea_go_baseline)
+gsea_go_baseline_df <- gsea_go_baseline_df[order(gsea_go_baseline_df$p.adjust), ]
+gsea_go_baseline_df[1:20, c("Description", "NES", "pvalue", "p.adjust")]
+```
+
+Todas las rutas top tienen NES negativo, lo que significa que estan infraexpresadas en EBV+ respecto a EBV-. Las rutas mas enriquecidas son:
+
+Fosforilacion oxidativa y cadena de transporte de electrones mitocondrial
+Traduccion citoplasmica y mitocondrial
+Sintesis de ATP
+
+Esto sugiere que las celulas de pacientes EBV+ tienen una menor actividad mitocondrial y metabolica en baseline respecto a EBV-.
+
+
+## Teplizumab vs Placebo por timepoint
+
+Aquí comparamos todos los pacientes tratados con teplizumab y placebo en los distintos timepoints
+
+```{r}
+timepoints <- c("Baseline", "Month1", "Month3", "Month14", "Month18", 
+                "Month30", "Month40", "Month84", "Month100")
+
+# Listas para guardar resultados
+results_by_timepoint <- list()
+degs_summary <- data.frame()
+
+for (tp in timepoints) {
+  
+  cat("\n====", tp, "====\n")
+  
+  # Filtrar muestras del timepoint
+  meta_tp <- metadata[metadata$Month == tp, ]
+  counts_tp <- counts[, meta_tp$Library]
+  
+  cat("Muestras:", nrow(meta_tp), 
+      "| Teplizumab:", sum(meta_tp$Treatment == "Teplizumab"),
+      "| Placebo:", sum(meta_tp$Treatment == "Placebo"), "\n")
+  
+  # Saltar timepoints sin ambos grupos
+  if (sum(meta_tp$Treatment == "Teplizumab") == 0 | 
+      sum(meta_tp$Treatment == "Placebo") == 0) {
+    cat("-> OMITIDO: falta un grupo de tratamiento\n")
+    next
+  }
+  
+  # Saltar timepoints con N total < 4
+  if (nrow(meta_tp) < 4) {
+    cat("-> OMITIDO: N insuficiente (< 4 muestras)\n")
+    next
+  }
+  
+  meta_tp$Treatment <- factor(meta_tp$Treatment, 
+                               levels = c("Placebo", "Teplizumab"))
+  
+  # Construir objeto DESeq2
+  dds_tp <- tryCatch({
+    dds <- DESeqDataSetFromMatrix(
+      countData = counts_tp,
+      colData   = meta_tp,
+      design    = ~ Treatment
+    )
+    keep <- rowSums(counts(dds)) >= 10
+    dds <- dds[keep, ]
+    DESeq(dds, quiet = TRUE)
+  }, error = function(e) {
+    cat("-> ERROR en DESeq:", conditionMessage(e), "\n")
+    return(NULL)
+  })
+  
+  if (is.null(dds_tp)) next
+  
+  # Resultados
+  res_tp <- results(dds_tp, contrast = c("Treatment", "Teplizumab", "Placebo"))
+  
+  # Shrinkage con ashr
+  res_tp_shrunk <- tryCatch({
+    lfcShrink(dds_tp, 
+              contrast = c("Treatment", "Teplizumab", "Placebo"),
+              type = "ashr", quiet = TRUE)
+  }, error = function(e) {
+    cat("-> ERROR en shrinkage, usando resultados sin shrinkage\n")
+    return(res_tp)
+  })
+  
+  # Guardar resultados
+  res_df <- as.data.frame(res_tp_shrunk)
+  res_df$gene <- rownames(res_df)
+  res_df$stat <- as.data.frame(res_tp)$stat  # stat original para GSEA
+  res_df <- res_df[order(res_df$padj), ]
+  results_by_timepoint[[tp]] <- res_df
+  
+  cat("\nTop 10 genes:\n")
+  print(head(res_df[, c("log2FoldChange", "pvalue", "padj")], 10))
+  
+  # Resumen DEGs
+  n_05 <- sum(res_df$padj < 0.05 & !is.na(res_df$padj))
+  n_up <- sum(res_df$padj < 0.05 & !is.na(res_df$padj) & res_df$log2FoldChange > 0)
+  n_dn <- sum(res_df$padj < 0.05 & !is.na(res_df$padj) & res_df$log2FoldChange < 0)
+  
+  degs_summary <- rbind(degs_summary, data.frame(
+    Timepoint    = tp,
+    N_muestras   = nrow(meta_tp),
+    N_teplizumab = sum(meta_tp$Treatment == "Teplizumab"),
+    N_placebo    = sum(meta_tp$Treatment == "Placebo"),
+    DEGs_FDR05   = n_05,
+    Sobreexpresados = n_up,
+    Infraexpresados = n_dn
+  ))
+  
+  cat("-> DEGs (FDR < 0.05):", n_05, 
+      "| Up:", n_up, "| Down:", n_dn, "\n")
+}
+```
+
+
+```{r}
+# Tabla resumen
+print(degs_summary)
+```
+Comprobamos especificamente que pasa en Month3
+
+```{r}
+# meta_m3 <- metadata[metadata$Month == "Month3", ]
+# counts_m3 <- counts[, meta_m3$Library]
+# 
+# meta_m3$Treatment <- factor(meta_m3$Treatment, levels = c("Placebo", "Teplizumab"))
+# 
+# dds_m3 <- DESeqDataSetFromMatrix(
+#   countData = counts_m3,
+#   colData   = meta_m3,
+#   design    = ~ Treatment
+# )
+# 
+# keep <- rowSums(counts(dds_m3)) >= 10
+# dds_m3 <- dds_m3[keep, ]
+# dds_m3 <- DESeq(dds_m3, quiet = TRUE)
+# 
+# res_m3 <- results(dds_m3, contrast = c("Treatment", "Teplizumab", "Placebo"))
+# summary(res_m3)
+```
+
+Al hacer el análisis en base a month3 vemos 1 DEGs, comprobamos si esto cambia al estudiar EBV+ vs EBV- en ambos grupos
+
+```{r}
+# meta_m3$EBVserology <- factor(meta_m3$EBVserology, 
+#                                levels = c("Negative", "Positive"))
+# 
+# dds_m3_ebv <- DESeqDataSetFromMatrix(
+#   countData = counts_m3,
+#   colData   = meta_m3,
+#   design    = ~ EBVserology + Treatment
+# )
+# 
+# keep <- rowSums(counts(dds_m3_ebv)) >= 10
+# dds_m3_ebv <- dds_m3_ebv[keep, ]
+# 
+# dds_m3_ebv <- DESeq(dds_m3_ebv)
+# res_m3_ebv <- results(dds_m3_ebv, 
+#                        contrast = c("Treatment", "Teplizumab", "Placebo"))
+# summary(res_m3_ebv)
+```
+Sigue saliendo 0 si estudiamos la comparacion teplizumab vs placebo en month3
+
+
+
+```{r}
+#GSEA para los tiempos viables 
+gsea_by_timepoint <- list()
+
+for (tp in names(results_by_timepoint)) {
+  
+  cat("\n=== GSEA:", tp, "===\n")
+  
+  res_df <- results_by_timepoint[[tp]]
+  
+  gene_list <- res_df$stat
+  names(gene_list) <- res_df$gene
+  gene_list <- gene_list[!is.na(gene_list)]
+  gene_list <- sort(gene_list, decreasing = TRUE)
+  
+  gsea_res <- tryCatch({
+    gseGO(
+      geneList     = gene_list,
+      OrgDb        = org.Hs.eg.db,
+      keyType      = "SYMBOL",
+      ont          = "BP",
+      minGSSize    = 15,
+      maxGSSize    = 500,
+      pvalueCutoff = 0.05,
+      verbose      = FALSE
+    )
+  }, error = function(e) {
+    cat("-> Sin rutas significativas o error:", conditionMessage(e), "\n")
+    return(NULL)
+  })
+  
+  if (!is.null(gsea_res) && nrow(as.data.frame(gsea_res)) > 0) {
+    gsea_by_timepoint[[tp]] <- gsea_res
+    gsea_df <- as.data.frame(gsea_res)[order(as.data.frame(gsea_res)$p.adjust), ]
+    cat("Rutas significativas:", nrow(gsea_df), "\n")
+    print(gsea_df[1:min(10, nrow(gsea_df)), c("Description", "NES", "p.adjust")])
+    
+  } else {
+    cat("-> Sin rutas significativas en", tp, "\n")
+  }
+}
+```
+
+## Dentro de Teplizumab: EBV+ vs EBV− por timepoint
+
+```{r}
+metadata_tep <- metadata[metadata$Treatment == "Teplizumab", ]
+table(metadata_tep$Month, metadata_tep$EBVserology)
+```
+
+
+```{r}
+timepoints_tep <- c("Baseline", "Month3", "Month40")
+
+results_tep_ebv <- list()
+degs_summary_tep <- data.frame()
+
+for (tp in timepoints_tep) {
+  
+  cat("\n====", tp, "====\n")
+  
+  meta_tp <- metadata_tep[metadata_tep$Month == tp, ]
+  counts_tp <- counts[, meta_tp$Library]
+  
+  n_pos <- sum(meta_tp$EBVserology == "Positive")
+  n_neg <- sum(meta_tp$EBVserology == "Negative")
+  cat("Muestras:", nrow(meta_tp), "| EBV+:", n_pos, "| EBV-:", n_neg, "\n")
+  
+  # Saltar si falta algún grupo
+  if (n_pos == 0 | n_neg == 0) {
+    cat("-> OMITIDO: falta un grupo EBV\n")
+    next
+  }
+  
+  # Saltar si N total < 4
+  if (nrow(meta_tp) < 3) {
+    cat("-> OMITIDO: N insuficiente (< 4 muestras)\n")
+    next
+  }
+  
+  meta_tp$EBVserology <- factor(meta_tp$EBVserology,
+                                 levels = c("Negative", "Positive"))
+  
+  dds_tp <- tryCatch({
+    dds <- DESeqDataSetFromMatrix(
+      countData = counts_tp,
+      colData   = meta_tp,
+      design    = ~ EBVserology
+    )
+    keep <- rowSums(counts(dds)) >= 10
+    dds <- dds[keep, ]
+    DESeq(dds, quiet = TRUE)
+  }, error = function(e) {
+    cat("-> ERROR en DESeq:", conditionMessage(e), "\n")
+    return(NULL)
+  })
+  
+  if (is.null(dds_tp)) next
+  
+  res_tp <- results(dds_tp, contrast = c("EBVserology", "Positive", "Negative"))
+  
+  # Shrinkage con ashr
+  res_tp_shrunk <- tryCatch({
+    lfcShrink(dds_tp,
+              contrast = c("EBVserology", "Positive", "Negative"),
+              type = "ashr", quiet = TRUE)
+  }, error = function(e) {
+    cat("-> Shrinkage no disponible, usando resultados sin shrinkage\n")
+    return(res_tp)
+  })
+  
+  res_df <- as.data.frame(res_tp_shrunk)
+  res_df$gene <- rownames(res_df)
+  res_df$stat <- as.data.frame(res_tp)$stat
+  res_df <- res_df[order(res_df$padj), ]
+  results_tep_ebv[[tp]] <- res_df
+  
+  n_05 <- sum(res_df$padj < 0.05 & !is.na(res_df$padj))
+  n_up <- sum(res_df$padj < 0.05 & !is.na(res_df$padj) & res_df$log2FoldChange > 0)
+  n_dn <- sum(res_df$padj < 0.05 & !is.na(res_df$padj) & res_df$log2FoldChange < 0)
+  
+  degs_summary_tep <- rbind(degs_summary_tep, data.frame(
+    Timepoint       = tp,
+    N_muestras      = nrow(meta_tp),
+    N_EBVpos        = n_pos,
+    N_EBVneg        = n_neg,
+    DEGs_FDR05      = n_05,
+    Sobreexpresados = n_up,
+    Infraexpresados = n_dn
+  ))
+  
+  cat("-> DEGs (FDR < 0.05):", n_05,
+      "| Up:", n_up, "| Down:", n_dn, "\n")
+}
+
+print(degs_summary_tep)
+```
+```{r}
+for (tp in names(results_tep_ebv)) {
+  cat("\n=== GSEA EBV en Teplizumab:", tp, "===\n")
+  gene_list <- results_tep_ebv[[tp]]$stat
+  names(gene_list) <- results_tep_ebv[[tp]]$gene
+  gene_list <- sort(gene_list[!is.na(gene_list)], decreasing = TRUE)
+  gsea_res <- tryCatch({
+    gseGO(geneList = gene_list, OrgDb = org.Hs.eg.db, keyType = "SYMBOL",
+          ont = "BP", minGSSize = 15, maxGSSize = 500, pvalueCutoff = 0.05, verbose = FALSE)
+  }, error = function(e) NULL)
+  if (!is.null(gsea_res) && nrow(as.data.frame(gsea_res)) > 0) {
+    gsea_df <- as.data.frame(gsea_res)[order(as.data.frame(gsea_res)$p.adjust), ]
+    cat("Rutas significativas:", nrow(gsea_df), "\n")
+    print(gsea_df[1:min(15, nrow(gsea_df)), c("Description", "NES", "p.adjust")])
+  } else {
+    cat("-> Sin rutas significativas\n")
+  }
+}
+```
+
