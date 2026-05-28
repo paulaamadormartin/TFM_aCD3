@@ -16,6 +16,18 @@ knitr::opts_chunk$set(
 )
 ```
 
+
+```{r}
+#paquetes
+library(dplyr)
+library(limma)
+library(edgeR)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(here)
+```
+
 Queremos ver dentro del grupo teplizumab los DEGs de los pacientes que progresaron o no hacia Diabetes.
 
 ```{r}
@@ -41,5 +53,71 @@ res_tep_base <- results(dds_tep_base,
                          contrast = c("T1D", "1", "0"))
 summary(res_tep_base)
 ```
+```{r}
+subset(as.data.frame(res_tep_base), padj < 0.05 & !is.na(padj))
+```
 
+```{r}
+# Solo Teplizumab, todos los timepoints
+
+# Normalizar con VST
+dds_tep <- DESeqDataSetFromMatrix(
+  countData = counts_tep,
+  colData   = metadata_tep,
+  design    = ~ 1
+)
+keep <- rowSums(counts(dds_tep)) >= 10
+dds_tep <- dds_tep[keep, ]
+vst_tep <- vst(dds_tep, blind = TRUE)
+expr <- assay(vst_tep)
+
+# Añadir TimeGroup y Responder al metadata
+metadata_tep$TimeGroup <- case_when(
+  metadata_tep$Month == "Baseline" ~ "Baseline",
+  metadata_tep$Month %in% c("Month1", "Month3", "Month14") ~ "Early",
+  metadata_tep$Month %in% c("Month18", "Month30", "Month40", "Month84", "Month100") ~ "Late"
+)
+metadata_tep$TimeGroup <- factor(metadata_tep$TimeGroup, levels = c("Baseline", "Early", "Late"))
+metadata_tep$Responder <- ifelse(metadata_tep$T1D == 0, "No progresa", "Progresa")
+
+# Formato largo
+genes_plot <- c("ATP1A4", "CASQ1", "SLC2A14")
+
+expr_long <- expr[genes_plot, ] %>%
+  as.data.frame() %>%
+  rownames_to_column("gene") %>%
+  pivot_longer(-gene, names_to = "Library", values_to = "expr") %>%
+  left_join(metadata_tep[, c("Library", "MASKID", "Month", "Responder", "TimeGroup")],
+            by = "Library")
+```
+
+
+```{r}
+# Calcular media y SE por gen, TimeGroup y Responder
+expr_summary <- expr_long %>%
+  group_by(gene, TimeGroup, Responder) %>%
+  summarise(
+    mean_expr = mean(expr),
+    se_expr   = sd(expr) / sqrt(n()),
+    .groups   = "drop"
+  )
+
+# Gráfico con facet por gen
+ggplot(expr_summary, aes(x = TimeGroup, y = mean_expr,
+                         color = Responder, group = Responder)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = mean_expr - se_expr,
+                    ymax = mean_expr + se_expr),
+                width = 0.2) +
+  facet_wrap(~ gene, scales = "free_y") +
+  scale_color_manual(values = c("No progresa" = "steelblue", "Progresa" = "tomato")) +
+  labs(x = "Timepoint", y = "Expresión media (VST)",
+       color = "Progresión T1D",
+       title = "Evolución temporal de DEGs en Teplizumab") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(here("results", "DEGs_temporales_teplizumab.png"),
+       width = 10, height = 4, dpi = 300)
+```
 
